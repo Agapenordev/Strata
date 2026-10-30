@@ -1,0 +1,15 @@
+# Sddm theme metadata.
+
+# theme.conf holds one value, the accent the colours are toned from; the
+# installer writes the wallpaper's there.
+
+[SddmGreeterTheme]
+Name=strata
+Description=The lock screen, before there is a desk behind it
+Author=Strata
+License=GPL-3.0
+Type=sddm-theme
+Version=1.0
+QtVersion=6
+MainScript=Main.qml
+ConfigFile=theme.conf

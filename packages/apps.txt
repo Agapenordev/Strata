@@ -1,0 +1,9 @@
+# Everyday applications that suit the desktop. Pick what you like; none of
+# them is required by Strata.
+dolphin
+MozillaFirefox
+kate
+okular
+keepassxc
+# Qt integration avoids LibreOffice's light fallback interface.
+libreoffice-qt6

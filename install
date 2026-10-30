@@ -1,0 +1,805 @@
+#!/usr/bin/env python3
+"""Install Strata on openSUSE Tumbleweed: a Quickshell desktop for Niri.
+
+    ./install              asks a few questions, shows the plan, then installs
+    ./install --dry-run    shows the plan and changes nothing
+    ./install --yes        takes the suggested answers without asking
+    ./install --with gaming,zram --without apps
+    ./install --restore STAMP     undoes what a run wrote
+    ./install --doctor            read-only health check
+
+The desktop itself is always installed; everything else is a group you can
+take or leave. Run it as your normal user from a local terminal: steps that
+need root use sudo. Every file it replaces is backed up first, and a Snapper
+snapshot is taken before system changes when Snapper is set up.
+"""
+import argparse
+import configparser
+import datetime
+import filecmp
+import glob
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+
+REPO = Path(__file__).resolve().parent
+SYSTEM_SRC = REPO / 'system'
+STATE = Path.home() / '.local/state/strata-tumbleweed'
+
+QUICKSHELL_REPO_ALIAS = 'home_AvengeMedia_danklinux'
+QUICKSHELL_REPO_URL = 'https://download.opensuse.org/repositories/home:/AvengeMedia:/danklinux/openSUSE_Tumbleweed/'
+CONFLICTING_POWER = ['tlp.service', 'tlp-pd.service', 'auto-cpufreq.service', 'tuned.service', 'tuned-ppd.service']
+CONSERVATION = '/sys/bus/platform/drivers/ideapad_acpi/VPC2004:*/conservation_mode'
+
+# What is installed
+
+# The desktop: always.
+CORE_PATHS = (
+    '.config/quickshell', '.config/niri', '.config/kitty',
+    '.config/gtk-3.0/settings.ini', '.config/gtk-4.0/settings.ini',
+    '.config/environment.d/60-strata.conf',
+    '.config/systemd/user/strata.service',
+    '.config/xdg-desktop-portal/niri-portals.conf',
+    '.local/bin/strata',
+    '.local/share/fonts', '.local/share/icons', '.local/share/wallpapers',
+    '.local/share/strata', '.local/share/rishot', '.local/bin/rishot',
+)
+
+# This machine's own Niri settings: created once, never replaced.
+LOCAL_FILES = ('.config/niri/local.kdl',)
+
+SDDM_FILES = (
+    'etc/sddm.conf.d/10-strata.conf',
+    'usr/share/sddm/themes/strata/Main.qml',
+    'usr/share/sddm/themes/strata/background.jpg',
+    'usr/share/sddm/themes/strata/metadata.desktop',
+    'usr/share/sddm/themes/strata/theme.conf',
+    'usr/share/sddm/themes/strata/components/AccountPill.qml',
+    'usr/share/sddm/themes/strata/components/Avatar.qml',
+    'usr/share/sddm/themes/strata/components/BatteryRing.qml',
+    'usr/share/sddm/themes/strata/components/Capsule.qml',
+    'usr/share/sddm/themes/strata/components/Clock.qml',
+    'usr/share/sddm/themes/strata/components/Icon.qml',
+    'usr/share/sddm/themes/strata/components/Notch.qml',
+    'usr/share/sddm/themes/strata/components/PowerRow.qml',
+    'usr/share/sddm/themes/strata/components/RingSpinner.qml',
+    'usr/share/sddm/themes/strata/components/SessionPicker.qml',
+    'usr/share/sddm/themes/strata/components/Theme.qml',
+    'usr/share/sddm/themes/strata/components/qmldir',
+)
+# The helper that sets your picture for the login and lock screens, run
+# through polkit (Settings › Session). Installed with the login screen.
+AVATAR_FILES = (
+    ('usr/lib/strata/avatar', 0o755),
+    ('usr/share/polkit-1/actions/org.strata.avatar.policy', 0o644),
+)
+# The login screen runs as the sddm user, which cannot see fonts in a home:
+# Strata's two are installed system-wide with it. Source, then target.
+SDDM_FONTS = (
+    ('home/.local/share/fonts/Rubik.ttf', 'usr/share/fonts/strata/Rubik.ttf'),
+    ('home/.local/share/fonts/Rubik-OFL.txt', 'usr/share/fonts/strata/Rubik-OFL.txt'),
+    ('home/.local/share/fonts/MaterialSymbolsRounded.ttf', 'usr/share/fonts/strata/MaterialSymbolsRounded.ttf'),
+    ('home/.local/share/fonts/MaterialSymbolsRounded-LICENSE.txt', 'usr/share/fonts/strata/MaterialSymbolsRounded-LICENSE.txt'),
+)
+
+
+class Group:
+    """An optional part: its packages (packages/<id>.txt), the home files it
+    adds, the system files it writes, and whether it is suggested here."""
+
+    def __init__(self, id, title, about, suggest, offer=lambda: True, paths=(), system=()):
+        self.id, self.title, self.about = id, title, about
+        self.suggest, self.offer = suggest, offer
+        self.paths, self.system = paths, system
+
+    def packages(self):
+        return package_list(f'{self.id}.txt') if (REPO / 'packages' / f'{self.id}.txt').exists() else []
+
+
+def has_nvidia():
+    result = quiet(['lspci', '-nn'])
+    return bool(result and re.search(r'(VGA|3D|Display).*NVIDIA', result.stdout))
+
+
+def has_battery():
+    return bool(glob.glob('/sys/class/power_supply/BAT*'))
+
+
+def has_ideapad():
+    return bool(glob.glob(CONSERVATION))
+
+
+def has_zram():
+    return (Path('/etc/systemd/zram-generator.conf').exists()
+            or Path('/usr/lib/systemd/zram-generator.conf').exists()
+            or any(p.name != '60-strata.conf' for p in Path('/etc/systemd/zram-generator.conf.d').glob('*.conf'))
+            or ok(['systemctl', 'is-enabled', '--quiet', 'zramswap.service']))
+
+
+GROUPS = [
+    Group('login', 'Login screen',
+          "Strata's look before you log in, matching the lock screen (SDDM)",
+          suggest=lambda: True),
+    Group('apps', 'Applications',
+          'Dolphin, Firefox, Kate, Okular, KeePassXC, LibreOffice, and their themes',
+          suggest=lambda: True, paths=('.config/mimeapps.list',)),
+    Group('media', 'Pictures and video', 'swayimg, imv, mpv and VLC',
+          suggest=lambda: True),
+    Group('terminal', 'Terminal extras',
+          'zsh with the starship prompt, fastfetch and btop, coloured like the desktop',
+          suggest=lambda: True,
+          paths=('.zshrc', '.config/starship.toml', '.config/fastfetch', '.config/btop/btop.conf',
+                 '.config/cava/config', '.local/share/zsh/site-functions/_strata')),
+    Group('power', 'Automatic power profiles',
+          'power-saver on battery, balanced or performance on AC',
+          suggest=has_battery, offer=has_battery,
+          paths=('.config/systemd/user/strata-power.service', '.local/bin/strata-power')),
+    Group('nvidia', 'NVIDIA driver',
+          'the signed open driver from openSUSE; the desktop stays on the other GPU',
+          suggest=has_nvidia, offer=has_nvidia, paths=('.local/bin/nvidia-run',)),
+    Group('gaming', 'Gaming', 'Steam, GameMode and MangoHud (needs the non-OSS repository)',
+          suggest=lambda: False),
+    Group('privacy', 'Privacy and hardening',
+          'firewall on, a new MAC address per network, no core dumps, kernel hardening, '
+          'no Firefox telemetry, TRIM',
+          suggest=lambda: False,
+          system=('etc/NetworkManager/conf.d/60-strata-privacy.conf',
+                  'etc/systemd/coredump.conf.d/60-strata-privacy.conf',
+                  'etc/sysctl.d/60-strata-hardening.conf',
+                  'etc/firefox/policies/policies.json')),
+    Group('zram', 'Compressed swap in memory', 'zram swap of up to half the memory, from the next boot',
+          suggest=lambda: False, offer=lambda: not has_zram(),
+          system=('etc/systemd/zram-generator.conf.d/60-strata.conf', 'etc/sysctl.d/60-strata-zram.conf')),
+    Group('battery', 'Battery care', 'stop charging around 80% on Lenovo IdeaPads',
+          suggest=lambda: False, offer=has_ideapad,
+          system=('etc/tmpfiles.d/60-strata-battery.conf',)),
+]
+BY_ID = {group.id: group for group in GROUPS}
+
+
+ALL_SYSTEM_TARGETS = {'/' + p for group in GROUPS for p in group.system}
+ALL_SYSTEM_TARGETS.update('/' + p for p in SDDM_FILES)
+ALL_SYSTEM_TARGETS.update('/' + target for _, target in SDDM_FONTS)
+ALL_SYSTEM_TARGETS.update('/' + path for path, _ in AVATAR_FILES)
+
+
+# Helpers
+
+def run(args, capture=False, check=True):
+    print('+ ' + shlex.join(map(str, args)), flush=True)
+    return subprocess.run(list(map(str, args)), check=check, text=True,
+                          stdout=subprocess.PIPE if capture else None)
+
+
+def quiet(args):
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def ok(args):
+    result = quiet(args)
+    return result is not None and result.returncode == 0
+
+
+def package_list(name):
+    return [line.split('#')[0].strip() for line in
+            (REPO / 'packages' / name).read_text().splitlines()
+            if line.split('#')[0].strip()]
+
+
+def user_paths(chosen):
+    return CORE_PATHS + tuple(path for group in GROUPS if group.id in chosen for path in group.paths)
+
+
+def source_files(chosen):
+    for relative in user_paths(chosen):
+        src = REPO / 'home' / relative
+        if not src.exists():
+            raise RuntimeError(f'Missing installer source: {src}')
+        for path in sorted(src.rglob('*')) if src.is_dir() else [src]:
+            if path.is_file() and '__pycache__' not in path.parts and path.suffix != '.pyc':
+                if path.is_symlink():
+                    raise RuntimeError(f'Refusing source symlink: {path}')
+                yield path, path.relative_to(REPO / 'home')
+
+
+def changed(src, dst):
+    return not dst.is_file() or not filecmp.cmp(src, dst, shallow=False)
+
+
+def safe_destination(home, relative):
+    dst = home / relative
+    if dst.is_symlink() or not dst.resolve().is_relative_to(home.resolve()):
+        raise RuntimeError(f'Refusing destination symlink outside HOME: {dst}')
+    if dst.exists() and not dst.is_file():
+        raise RuntimeError(f'Expected a file at {dst}')
+    return dst
+
+
+def check_version(binary, minimum):
+    text = run([binary, '--version'], capture=True).stdout
+    match = re.search(r'(\d+)\.(\d+)(?:\.(\d+))?', text)
+    if not match or tuple(map(int, (match[1], match[2], match[3] or 0))) < minimum:
+        raise RuntimeError(f'{binary} needs version {".".join(map(str, minimum))} or later: {text}')
+
+
+def repo_aliases():
+    result = quiet(['zypper', '--no-refresh', '-x', 'lr'])
+    return re.findall(r'alias="([^"]+)"', result.stdout) if result else []
+
+
+def repo_urls():
+    result = quiet(['zypper', '--no-refresh', '-x', 'lr'])
+    return re.findall(r'<url>([^<]+)</url>', result.stdout) if result else []
+
+
+def try_install(names, why):
+    """Install optional packages; one that cannot be resolved is reported, not fatal."""
+    if not names:
+        return
+    probe = run(['sudo', 'zypper', '--non-interactive', 'install', '--dry-run', '--no-recommends', *names], check=False)
+    if probe.returncode != 0:
+        print(f'WARNING: could not resolve the {why} packages {names}; skipped. Install them later by hand.', flush=True)
+        return
+    run(['sudo', 'zypper', 'install', '--no-recommends', *names])
+
+
+def render_device():
+    """On a machine with an NVIDIA card and another GPU, the other one's
+    render node by its stable PCI path, for the desktop to draw on."""
+    others = []
+    for device in sorted(glob.glob('/sys/bus/pci/devices/*')):
+        try:
+            if not Path(device, 'class').read_text().startswith('0x03'):
+                continue
+            vendor = Path(device, 'vendor').read_text().strip()
+            boot = Path(device, 'boot_vga').read_text().strip() == '1' if Path(device, 'boot_vga').exists() else False
+        except OSError:
+            continue
+        if vendor != '0x10de':
+            others.append((not boot, os.path.basename(device)))
+    if not others:
+        return ''
+    address = sorted(others)[0][1]
+    node = f'/dev/dri/by-path/pci-{address}-render'
+    return node if os.path.exists(node) else ''
+
+
+# Choosing
+
+def choose(args):
+    """The groups to install: asked, or taken from the flags."""
+    offered = [group for group in GROUPS if group.offer()]
+    asked_for = {name.strip() for name in (args.with_ or '').split(',') if name.strip()}
+    refused = {name.strip() for name in (args.without or '').split(',') if name.strip()}
+    unknown = (asked_for | refused) - set(BY_ID)
+    if unknown:
+        raise RuntimeError(f'Unknown group(s): {", ".join(sorted(unknown))}. Groups: {", ".join(BY_ID)}')
+    chosen = set()
+    interactive = sys.stdin.isatty() and not args.yes and not args.dry_run
+    if interactive:
+        print('Strata installs its desktop. These are optional; Enter takes the suggestion.\n')
+    for group in offered:
+        suggested = group.suggest()
+        if group.id in asked_for:
+            take = True
+        elif group.id in refused:
+            take = False
+        elif interactive:
+            answer = input(f'  {group.title} — {group.about}? [{"Y/n" if suggested else "y/N"}] ').strip().lower()
+            take = suggested if answer == '' else answer.startswith('y')
+        else:
+            take = suggested
+        if take:
+            chosen.add(group.id)
+    for name in asked_for - {group.id for group in offered}:
+        raise RuntimeError(f'"{name}" is not available on this machine ({BY_ID[name].about}).')
+    return chosen
+
+
+def plan(chosen, args):
+    home = Path.home()
+    packages = package_list('core.txt') + [p for g in GROUPS if g.id in chosen for p in g.packages()]
+    replaced = [rel for src, rel in source_files(chosen)
+                if (home / rel).exists() and changed(src, home / rel) and str(rel) not in LOCAL_FILES]
+    print('\n── The plan ─────────────────────────────────────────────────────')
+    print('Desktop      : Niri, Strata (Quickshell), kitty, fonts, icons, wallpapers')
+    print('Groups       : ' + (', '.join(BY_ID[g].title for g in GROUPS_ORDER(chosen)) or 'none'))
+    print('Repositories : ' + ('Quickshell (OBS home:AvengeMedia:danklinux)' if not any('danklinux' in u for u in repo_urls())
+                               else 'Quickshell repository already there')
+          + (' + openSUSE NVIDIA' if 'nvidia' in chosen else ''))
+    print(f'Packages     : {len(packages)} (only missing ones are installed)')
+    print(f'Your files   : {len(replaced)} would be replaced, each backed up first'
+          + (f' (e.g. ~/{replaced[0]})' if replaced else ''))
+    if 'power' in chosen:
+        print(f'Power        : power-saver on battery, {args.ac_profile} on AC')
+    if 'nvidia' in chosen:
+        device = render_device()
+        print('GPU          : the desktop draws on ' + (device or 'the default GPU'))
+    print('Undo         : ./install --restore <stamp>, printed when it starts')
+    print('─────────────────────────────────────────────────────────────────\n')
+
+
+def GROUPS_ORDER(chosen):
+    return [group.id for group in GROUPS if group.id in chosen]
+
+
+# Doctor (read-only)
+
+def doctor():
+    def show(title, command):
+        print(f'\n── {title}\n$ {command}', flush=True)
+        subprocess.run(['sh', '-c', command], timeout=30, check=False)
+
+    show('Versions', 'niri --version; qs --version; kitty --version; uname -r')
+    show('Fonts', 'fc-match "Rubik"; fc-match "Material Symbols Rounded"; fc-match "JetBrainsMono Nerd Font Mono"; '
+                  'fc-match "Noto Color Emoji"')
+    show('Session', 'systemctl --user is-active niri.service graphical-session.target xdg-desktop-portal.service')
+    show('Strata services', 'systemctl --user --no-pager status strata.service strata-power.service 2>&1 | head -20')
+    show('Niri configuration', 'niri validate 2>&1 | tail -2')
+    show('Screens', "niri msg outputs | grep -E 'Output|Current mode|Variable'")
+    show('GPUs', "lspci -nn | grep -Ei 'vga|3d|display'; "
+                 "for d in /sys/bus/pci/devices/*; do [ \"$(cat $d/vendor)\" = 0x10de ] && [ -e $d/power/runtime_status ] "
+                 "&& echo \"NVIDIA $(basename $d): $(cat $d/power/runtime_status)\"; done")
+    show('Power profile', 'powerprofilesctl get 2>/dev/null || echo "power-profiles-daemon is not running"')
+    show('Memory and swap', 'free -h; swapon --show')
+    show('Failed units', 'systemctl --failed --no-pager; systemctl --user --failed --no-pager')
+
+
+# Restore
+
+def restore(stamp):
+    home = Path.home()
+    backup = STATE / 'backups' / stamp
+    manifest_file = backup / 'manifest.json'
+    if not manifest_file.is_file():
+        available = sorted(p.name for p in (STATE / 'backups').glob('*')) if (STATE / 'backups').is_dir() else []
+        raise RuntimeError(f'No backup {stamp}. Available: {", ".join(available) or "none"}')
+    manifest = json.loads(manifest_file.read_text())
+    for relative in manifest.get('replaced', []):
+        src, dst = backup / 'home' / relative, safe_destination(home, relative)
+        if src.is_file():
+            shutil.copy2(src, dst)
+            print(f'restored ~/{relative}')
+    for relative in manifest.get('created', []):
+        dst = safe_destination(home, relative)
+        if dst.is_file():
+            dst.unlink()
+            print(f'removed ~/{relative}')
+    system_backup = manifest.get('system_backup')
+    if system_backup:
+        created = run(['sudo', 'cat', f'{system_backup}/created.txt'], capture=True, check=False).stdout or ''
+        for target in created.split():
+            if target in ALL_SYSTEM_TARGETS:      # never trust arbitrary paths
+                run(['sudo', 'rm', '-f', target])
+        for target in sorted(ALL_SYSTEM_TARGETS):
+            saved = f'{system_backup}{target}'
+            if run(['sudo', 'test', '-f', saved], check=False).returncode == 0:
+                run(['sudo', 'install', '-d', os.path.dirname(target)])
+                run(['sudo', 'cp', '-a', saved, target])
+        print('System files restored. Services the run enabled are left enabled, and packages are not '
+              'removed. For a whole-system rollback, boot an earlier Snapper snapshot from the boot menu.')
+    run(['systemctl', '--user', 'daemon-reload'], check=False)
+    print('Restore finished. Log out and back in.')
+
+
+# Install
+
+def preflight(chosen):
+    if os.geteuid() == 0:
+        raise RuntimeError('Run as your normal user, not with sudo. Individual steps use sudo.')
+    release = dict(line.split('=', 1) for line in Path('/etc/os-release').read_text().splitlines() if '=' in line)
+    if release.get('ID', '').strip('"') != 'opensuse-tumbleweed':
+        raise RuntimeError('Strata installs on openSUSE Tumbleweed. Nothing was changed.')
+    if 'privacy' in chosen and os.environ.get('SSH_CONNECTION'):
+        raise RuntimeError('Run the privacy group from a local terminal: it changes the firewall.')
+    home = Path.home()
+    for variable, default in [('XDG_CONFIG_HOME', home / '.config'), ('XDG_DATA_HOME', home / '.local/share')]:
+        if os.environ.get(variable) and Path(os.environ[variable]) != default:
+            raise RuntimeError(f'This installer uses the standard home folders; unset {variable} first.')
+    if 'zram' in chosen and has_zram():
+        raise RuntimeError('This machine already has zram set up; keep it, or remove it before choosing zram.')
+    if 'gaming' in chosen and not any('non-oss' in alias.lower() for alias in repo_aliases()):
+        raise RuntimeError('The gaming group installs Steam from the non-OSS repository, which is not enabled. '
+                           'Enable it in YaST or with `sudo zypper modifyrepo --enable repo-non-oss`, then run again.')
+
+
+def power_manager_conflict():
+    for unit in CONFLICTING_POWER:
+        for verb in ['is-active', 'is-enabled']:
+            if ok(['systemctl', verb, '--quiet', unit]):
+                return unit
+    return ''
+
+
+def ensure_repos(chosen):
+    if not any('danklinux' in url for url in repo_urls()):
+        # Priority 120 (< default 99 in preference): its builds never replace
+        # official ones; only packages missing elsewhere come from it.
+        run(['sudo', 'zypper', 'addrepo', '--refresh', '--priority', '120', '--name',
+             'Quickshell (home:AvengeMedia:danklinux)', QUICKSHELL_REPO_URL, QUICKSHELL_REPO_ALIAS])
+    if 'nvidia' in chosen and not any('nvidia' in url.lower() for url in repo_urls()):
+        run(['sudo', 'zypper', 'install', '--no-recommends', 'openSUSE-repos-Tumbleweed-NVIDIA'])
+    # Interactive on purpose: you are shown each new signing key and asked to trust it.
+    run(['sudo', 'zypper', 'refresh'])
+
+
+def snapshot(description):
+    configs = run(['sudo', 'snapper', 'list-configs'], capture=True, check=False)
+    if configs.returncode == 0 and re.search(r'^\s*root\b', configs.stdout or '', re.M):
+        run(['sudo', 'snapper', 'create', '--type', 'single', '--cleanup-algorithm', 'number',
+             '--description', description], check=False)
+    else:
+        print('Snapper is not set up for / ; going on with file backups only.')
+
+
+def install_packages(chosen):
+    core = [p for p in package_list('core.txt') if p != 'quickshell']
+    # The desktop's own packages are resolved together before anything is
+    # installed, so a missing one stops the run before it starts.
+    run(['sudo', 'zypper', '--non-interactive', 'install', '--dry-run', '--no-recommends', *core])
+    run(['sudo', 'zypper', 'install', '--no-recommends', *core])
+    # Quickshell only from its repository, so a same-named build elsewhere is never used.
+    from_repo = QUICKSHELL_REPO_ALIAS if QUICKSHELL_REPO_ALIAS in repo_aliases() else \
+        next((a for a in repo_aliases() if 'danklinux' in a.lower()), None)
+    run(['sudo', 'zypper', 'install', '--no-recommends', *(['--from', from_repo] if from_repo else []), 'quickshell'])
+    for group in GROUPS:
+        if group.id in chosen and group.id != 'nvidia':
+            try_install(group.packages(), group.title.lower())
+    if 'nvidia' in chosen:
+        # Explicit selection avoids an old unsigned module chosen by hardware recommends.
+        if ok(['rpm', '-q', 'nvidia-driver-G06-kmp-default']):
+            run(['sudo', 'zypper', 'remove', 'nvidia-driver-G06-kmp-default'])
+        run(['sudo', 'zypper', 'install', '--no-recommends',
+             'nvidia-open-driver-G06-signed-kmp-meta', 'nvidia-compute-G06',
+             'nvidia-compute-utils-G06', 'nvidia-gl-G06', 'nvidia-video-G06',
+             *(['nvidia-gl-G06-32bit'] if 'gaming' in chosen else []), *BY_ID['nvidia'].packages()])
+
+
+def configure_flatpak_nvidia():
+    """Flatpak Steam needs the driver's matching GL runtime, and PRIME offload."""
+    if not ok(['flatpak', 'info', 'com.valvesoftware.Steam']):
+        return
+    result = quiet(['nvidia-smi', '--query-gpu=driver_version', '--format=csv,noheader'])
+    version = result.stdout.splitlines()[0].strip() if result and result.returncode == 0 else ''
+    if not re.fullmatch(r'\d+\.\d+\.\d+', version):
+        print('NVIDIA: the driver is not loaded yet; reboot and run ./install again for Flatpak Steam.')
+        return
+    suffix = version.replace('.', '-')
+    run(['flatpak', 'remote-add', '--user', '--if-not-exists', 'flathub',
+         'https://dl.flathub.org/repo/flathub.flatpakrepo'])
+    run(['flatpak', 'install', '--user', '--noninteractive', 'flathub',
+         f'org.freedesktop.Platform.GL.nvidia-{suffix}',
+         f'org.freedesktop.Platform.GL32.nvidia-{suffix}'])
+    run(['flatpak', 'override', '--user', 'com.valvesoftware.Steam',
+         '--env=__NV_PRIME_RENDER_OFFLOAD=1',
+         '--env=__GLX_VENDOR_LIBRARY_NAME=nvidia',
+         '--env=__VK_LAYER_NV_optimus=NVIDIA_only'])
+
+
+def write_file(relative, content, backup, manifest, save):
+    """Write one home file, backing up what was there."""
+    home = Path.home()
+    dst = safe_destination(home, relative)
+    if dst.exists() and dst.read_text() == content:
+        return
+    if dst.exists():
+        kept = backup / 'home' / relative
+        kept.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(dst, kept)
+        manifest['replaced'].append(str(relative))
+    else:
+        manifest['created'].append(str(relative))
+    save()
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text(content)
+
+
+def copy_user_files(chosen, args, backup, manifest, save):
+    home = Path.home()
+    for src, relative in source_files(chosen):
+        dst = safe_destination(home, relative)
+        # This machine's own settings: made once, then the user's.
+        if str(relative) in LOCAL_FILES and dst.exists():
+            continue
+        if not changed(src, dst):
+            shutil.copymode(src, dst)
+            continue
+        if dst.exists():
+            kept = backup / 'home' / relative
+            kept.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(dst, kept)
+            manifest['replaced'].append(str(relative))
+        else:
+            manifest['created'].append(str(relative))
+        save()  # Record intent before writing, including a partially failed run.
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if str(relative) in LOCAL_FILES:
+            dst.write_text(local_kdl(src.read_text(), chosen))
+        else:
+            shutil.copy2(src, dst)
+    if 'power' in chosen:
+        write_file('.config/systemd/user/strata-power.service.d/profile.conf',
+                   f'[Service]\nEnvironment=STRATA_AC_PROFILE={args.ac_profile}\n', backup, manifest, save)
+    (home / 'Pictures/Screenshots').mkdir(parents=True, exist_ok=True)
+    run(['fc-cache', '-f'])
+    run(['xdg-user-dirs-update'], check=False)
+    run(['systemctl', '--user', 'daemon-reload'])
+    run(['systemctl', '--user', 'enable', 'strata.service', *(['strata-power.service'] if 'power' in chosen else [])])
+
+
+def local_kdl(template, chosen):
+    """This machine's local.kdl, the first time: the template, and the GPU
+    the desktop draws on when there is an NVIDIA card beside another."""
+    device = render_device() if 'nvidia' in chosen else ''
+    if not device:
+        return template
+    return template + f'''
+// The desktop draws on the integrated GPU, by its stable PCI path, so the
+// NVIDIA card can sleep until a program asks for it (`nvidia-run`).
+debug {{
+    render-drm-device "{device}"
+}}
+'''
+
+
+def initialize_appearance(chosen, backup, manifest, save):
+    """Seed missing runtime fragments only; keep choices on every rerun.
+
+    No running application is contacted. Strata refreshes these from the
+    palette when the session starts.
+    """
+    script_dir = REPO / 'home/.config/quickshell/scripts'
+    sys.path.insert(0, str(script_dir))
+    try:
+        spec = importlib.util.spec_from_file_location('strata_theme_seed', script_dir / 'theme_manager.py')
+        theme = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(theme)
+    finally:
+        sys.path.pop(0)
+    colors = theme.build_palette(None)
+    home = Path.home()
+    template = REPO / 'home/.local/share/strata/kvantum'
+    kvantum_config, kvantum_svg = theme.build_kvantum_theme(
+        colors, (template / 'Strata.kvconfig').read_text(),
+        (template / 'Strata.svg').read_text())
+    generated = {
+        '.local/state/quickshell/kitty-font.conf': 'font_family JetBrainsMono Nerd Font Mono\n',
+        '.local/state/quickshell/kitty-ground.conf': 'background #000000\nbackground_opacity 1.0\n',
+        '.local/state/quickshell/kitty-palette.conf': 'background #000000\nforeground #eef2f7\n',
+        '.config/qt6ct/qt6ct.conf': theme.build_qt6ct_config(),
+        '.local/share/color-schemes/Strata.colors': theme.build_kde_scheme(colors),
+        '.config/qt6ct/colors/strata.conf': theme.build_qt_colors(colors),
+        '.config/Kvantum/Strata/Strata.kvconfig': kvantum_config,
+        '.config/Kvantum/Strata/Strata.svg': kvantum_svg,
+        '.config/gtk-3.0/gtk.css': theme.build_gtk3_css(colors),
+        '.config/gtk-4.0/gtk.css': theme.build_gtk4_css(colors),
+        '.local/share/icons/strata/index.theme':
+            '[Icon Theme]\nName=Strata\nInherits=Papirus-Dark,Adwaita,hicolor\nDirectories=\n',
+    }
+    for relative, content in generated.items():
+        dst = safe_destination(home, relative)
+        if dst.exists():
+            continue
+        manifest['created'].append(relative)
+        save()
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(content)
+
+    def merge_preferences(relative, entries):
+        dst = safe_destination(home, relative)
+        parser = configparser.RawConfigParser(strict=False)
+        parser.optionxform = str
+        if dst.exists():
+            parser.read(dst, encoding='utf-8')
+        needed = False
+        for section, key, value, force in entries:
+            if not parser.has_section(section):
+                parser.add_section(section)
+            if force or not parser.has_option(section, key):
+                needed = needed or parser.get(section, key, fallback=None) != value
+                parser.set(section, key, value)
+        if not needed:
+            return
+        if dst.exists():
+            kept = backup / 'home' / relative
+            kept.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(dst, kept)
+            manifest['replaced'].append(relative)
+        else:
+            manifest['created'].append(relative)
+        save()
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        with dst.open('w') as handle:
+            parser.write(handle, space_around_delimiters=False)
+
+    if 'apps' in chosen:
+        merge_preferences('.config/dolphinrc', [
+            ('UiSettings', 'ColorScheme', 'Strata', True),
+            ('General', 'SortFoldersFirst', 'true', False),
+            ('IconsMode', 'IconSize', '64', False),
+            ('IconsMode', 'PreviewSize', '80', False),
+            ('KFileDialog Settings', 'Places Icons Static Size', '22', False),
+        ])
+    merge_preferences('.config/Kvantum/kvantum.kvconfig', [
+        ('General', 'theme', 'Strata', True),
+    ])
+
+
+def sddm_accent():
+    """The wallpaper's accent from the shell's last extraction, or ""."""
+    colours = Path.home() / '.local/state/quickshell/dynamic-colors.json'
+    try:
+        accent = json.loads(colours.read_text()).get('accent', '')
+    except (OSError, ValueError):
+        return ''
+    return accent if re.fullmatch(r'#[0-9a-fA-F]{6}', accent or '') else ''
+
+
+def configure_system(chosen, stamp, manifest, save, backup):
+    system_backup = Path('/var/lib/strata-tumbleweed/backups') / stamp
+    run(['sudo', 'install', '-d', '-m', '0700', system_backup])
+    manifest['system_backup'] = str(system_backup)
+    save()
+    (backup / 'services-before.txt').write_text(
+        run(['systemctl', 'list-unit-files', '--no-pager'], capture=True).stdout)
+    if 'privacy' in chosen:
+        listing = run(['sudo', 'firewall-offline-cmd', '--list-all-zones'], capture=True, check=False).stdout or ''
+        (backup / 'firewall-before.txt').write_text(listing)
+    targets = [(SYSTEM_SRC / relative, Path('/') / relative)
+               for group in GROUPS if group.id in chosen for relative in group.system]
+    if 'login' in chosen:
+        targets += [(REPO / 'system' / relative, Path('/') / relative) for relative in SDDM_FILES]
+        targets += [(REPO / source, Path('/') / target) for source, target in SDDM_FONTS]
+        targets += [(REPO / 'system' / path, Path('/') / path) for path, _ in AVATAR_FILES]
+    for source, target in targets:
+        if target.is_symlink():
+            raise RuntimeError(f'Refusing system symlink: {target}')
+        if target.exists():
+            run(['sudo', 'cp', '--parents', '-a', target, system_backup])
+        else:
+            run(['sudo', 'sh', '-c', 'printf "%s\\n" "$1" >> "$2/created.txt"', 'sh', target, system_backup])
+        mode = next((m for path, m in AVATAR_FILES if Path('/') / path == target), 0o644)
+        run(['sudo', 'install', '-D', '-m', f'{mode:04o}', source, target])
+
+    # power-profiles-daemon is the desktop's (the battery panel switches
+    # profiles); another power manager running is left alone.
+    conflict = power_manager_conflict()
+    if conflict:
+        print(f'NOTE: {conflict} manages power here, so power-profiles-daemon is not enabled.')
+    else:
+        run(['sudo', 'systemctl', 'enable', '--now', 'power-profiles-daemon.service'], check=False)
+
+    if 'login' in chosen:
+        run(['sudo', 'fc-cache', '-f', '/usr/share/fonts/strata'])
+        # The login screen's colours are tones of the wallpaper's accent, as
+        # the shell last extracted it.
+        accent = sddm_accent()
+        if accent:
+            conf = '/usr/share/sddm/themes/strata/theme.conf'
+            run(['sudo', 'sh', '-c', 'printf "[General]\\naccent=%s\\n" "$1" > "$2"', 'sh', accent, conf])
+        run(['sudo', 'install', '-d', '-m', '0755', '/var/lib/strata/faces'])
+        run(['sudo', 'systemctl', 'set-default', 'graphical.target'])
+        display_manager = Path('/etc/systemd/system/display-manager.service')
+        alias_target = display_manager.resolve().name if display_manager.is_symlink() else ''
+        if not display_manager.exists() or alias_target in ('sddm.service', 'display-manager-legacy.service'):
+            run(['sudo', 'systemctl', 'enable', '--force', 'sddm.service'])
+        else:
+            print(f'NOTE: {alias_target or "another display manager"} stays the login screen; '
+                  'switch to sddm in YaST to see Strata\'s.')
+    if 'privacy' in chosen:
+        run(['sudo', 'systemctl', 'enable', '--now', 'firewalld.service', 'fstrim.timer'])
+        run(['sudo', 'firewall-cmd', '--set-default-zone=public'])
+        # A machine that does not run an SSH server should not expose port 22.
+        if not ok(['systemctl', 'is-enabled', '--quiet', 'sshd.service']):
+            for permanent in (['--permanent'], []):
+                run(['sudo', 'firewall-cmd', *permanent, '--zone=public', '--remove-service=ssh'], check=False)
+        run(['sudo', 'sysctl', '-p', '/etc/sysctl.d/60-strata-hardening.conf'])
+        print('Network privacy settings apply to connections made after the next reboot.')
+    if 'battery' in chosen:
+        run(['sudo', 'systemd-tmpfiles', '--create', '/etc/tmpfiles.d/60-strata-battery.conf'])
+    if 'zram' in chosen:
+        print('zram swap starts at the next boot.')
+
+
+def record_version():
+    """Writes what the settings' System page shows and checks for updates
+    against: the version, the branch, this checkout, and the tree copied."""
+    def git(*args):
+        result = quiet(['git', '-C', str(REPO), *args])
+        return result.stdout.strip() if result and result.returncode == 0 else ''
+    lines = [git('describe', '--tags', '--always', '--abbrev=7', '--dirty') or 'unknown',
+             git('rev-parse', '--abbrev-ref', 'HEAD'), str(REPO) if git('rev-parse', '--git-dir') else '',
+             git('rev-parse', 'HEAD^{tree}')]
+    target = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state') / 'strata/version'
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text('\n'.join(lines) + '\n')
+
+
+def install(chosen, args):
+    preflight(chosen)
+    stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f')
+    backup = STATE / 'backups' / stamp
+    backup.mkdir(parents=True, mode=0o700)
+    manifest = {'created': [], 'replaced': [], 'system_backup': None, 'groups': sorted(chosen), 'ac_profile': args.ac_profile}
+
+    def save():
+        (backup / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+    save()
+    print(f'Backup and record of this run: {backup}\nUndo it with: ./install --restore {stamp}\n')
+
+    snapshot(f'Before Strata install {stamp}')
+    ensure_repos(chosen)
+    install_packages(chosen)
+    if 'nvidia' in chosen:
+        configure_flatpak_nvidia()
+    check_version('niri', (26, 4, 0))
+    check_version('qs', (0, 3, 0))
+    # Tumbleweed keeps vendor PAM files in /usr/lib/pam.d; /etc/pam.d overrides.
+    if not any(Path(d, 'swaylock').exists() for d in ('/etc/pam.d', '/usr/lib/pam.d')):
+        raise RuntimeError('The swaylock package must provide its PAM service before Strata can lock the screen.')
+    copy_user_files(chosen, args, backup, manifest, save)
+    initialize_appearance(chosen, backup, manifest, save)
+    configure_system(chosen, stamp, manifest, save, backup)
+    run(['niri', 'validate', '--config', Path.home() / '.config/niri/config.kdl'])
+    record_version()
+    print('\nInstalled. Log out, choose the "Niri" session, and log in. '
+          '`./install --doctor` checks everything afterwards.')
+    if 'nvidia' in chosen:
+        print('NVIDIA: if a blue "Perform MOK management" screen appears at the next boot, choose '
+              '"Enroll MOK" and type the password zypper showed, so Secure Boot accepts the driver.')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--yes', '-y', action='store_true', help='take the suggested answers without asking')
+    parser.add_argument('--dry-run', action='store_true', help='show the plan and change nothing')
+    parser.add_argument('--with', dest='with_', metavar='GROUPS', help='add groups, comma separated: ' + ', '.join(BY_ID))
+    parser.add_argument('--without', metavar='GROUPS', help='leave groups out, comma separated')
+    parser.add_argument('--ac-profile', choices=['balanced', 'performance'], default='balanced',
+                        help='power profile on AC with the power group (battery uses power-saver)')
+    parser.add_argument('--doctor', action='store_true', help='read-only health check')
+    parser.add_argument('--restore', metavar='STAMP', help='undo what an earlier run wrote')
+    parser.add_argument('--groups', action='store_true', help='list the optional groups and exit')
+    args = parser.parse_args()
+    if args.groups:
+        for group in GROUPS:
+            mark = '' if group.offer() else '  (not on this machine)'
+            print(f'{group.id:<10} {group.title}: {group.about}{mark}')
+        return
+    if args.doctor:
+        doctor()
+        return
+    if args.restore:
+        restore(args.restore)
+        return
+    chosen = choose(args)
+    plan(chosen, args)
+    if args.dry_run:
+        print('Dry run: nothing was changed.')
+        return
+    if sys.stdin.isatty() and not args.yes:
+        if not input('Install? [y/N] ').strip().lower().startswith('y'):
+            print('Nothing was changed.')
+            return
+    install(chosen, args)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+        print(f'\nSTOPPED: {error}\nPackage transactions that finished are not undone automatically; '
+              'files written so far can be with ./install --restore.', file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print('\nStopped.', file=sys.stderr)
+        sys.exit(130)

@@ -1,0 +1,5 @@
+# Helpers for an NVIDIA card. The driver itself is chosen by ./install
+# (the signed open kernel modules from openSUSE's NVIDIA repository).
+nvtop
+switcheroo-control
+mokutil

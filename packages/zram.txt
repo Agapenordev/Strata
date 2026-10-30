@@ -1,0 +1,2 @@
+# Compressed swap in memory.
+zram-generator

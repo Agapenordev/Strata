@@ -1,0 +1,4 @@
+# Firewall, snapshots before changes, and firmware updates.
+firewalld
+snapper
+fwupd

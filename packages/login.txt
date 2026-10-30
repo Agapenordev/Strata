@@ -1,0 +1,4 @@
+# Login screen: SDDM with Strata's theme (the lock screen before login).
+sddm-qt6
+xorg-x11-server
+xf86-input-libinput

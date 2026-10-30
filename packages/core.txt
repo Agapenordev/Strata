@@ -1,0 +1,78 @@
+# Strata: what the desktop itself needs on openSUSE Tumbleweed + Niri.
+# One package per line. `quickshell` comes from the OBS repository
+# home:AvengeMedia:danklinux, which ./install adds (at a low priority, so it
+# never replaces an official package). Optional groups are the other files
+# in this folder.
+
+# Compositor and shell
+niri
+xwayland-satellite
+quickshell
+awww
+swaylock
+wlsunset
+
+# Session plumbing
+xdg-desktop-portal
+xdg-desktop-portal-gnome
+xdg-desktop-portal-gtk
+gnome-keyring
+xdg-user-dirs
+xdg-utils
+accountsservice
+dbus-1-tools
+
+# Hardware, audio, network
+NetworkManager
+bluez
+upower
+power-profiles-daemon
+brightnessctl
+ddcutil
+pipewire
+pipewire-pulseaudio
+wireplumber
+pulseaudio-utils
+playerctl
+sensors
+pciutils
+
+# The terminal the shell opens things in
+kitty
+kitty-shell-integration
+kitty-terminfo
+nano
+
+# Shell features: clipboard, screenshots, recording, OCR, notifications,
+# file pickers, theming
+wl-clipboard
+ImageMagick
+wf-recorder
+ffmpeg-8
+tesseract-ocr
+libnotify-tools
+kdialog
+gtk3-tools
+glib2-tools
+cava
+
+# Qt runtime used by the shell
+qt6-declarative-imports
+qt6-multimedia-imports
+qt6-qt5compat-imports
+qt6-imageformats
+libQt6Svg6
+qt6ct
+kvantum-qt6
+kvantum-manager
+# The Wayland platform plugin is needed even with --no-recommends.
+qt6-wayland
+
+# Fonts and icons (Strata's own, Rubik and Material Symbols, ship with it)
+fontconfig
+adwaita-fonts
+google-noto-coloremoji-fonts
+inter-fonts
+jetbrains-mono-fonts
+adwaita-icon-theme
+papirus-icon-theme

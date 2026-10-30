@@ -1,0 +1,11 @@
+#%PAM-1.0
+# Pam: face unlock for the lock screen, beside the password.
+
+# The lock screen's second service, run next to `login` rather than inside
+# it: a face that is not recognised never counts against the password's
+# attempts, and the password never waits on the camera. Only the lock screen
+# uses it. It needs howdy; without it the `-` skips the line quietly and the
+# service refuses.
+
+-auth       sufficient  pam_howdy.so
+auth        required    pam_deny.so

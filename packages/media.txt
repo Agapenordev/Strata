@@ -1,0 +1,5 @@
+# Viewing pictures and playing video.
+swayimg
+imv
+mpv
+vlc

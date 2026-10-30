@@ -1,0 +1,9 @@
+# Steam and tools for games. Steam needs the non-OSS repository.
+gamemode
+mangohud
+steam
+Mesa-32bit
+libvulkan1-32bit
+libvulkan_radeon
+libvulkan_radeon-32bit
+vulkan-tools

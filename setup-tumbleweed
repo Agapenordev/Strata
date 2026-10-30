@@ -1,0 +1,5 @@
+#!/bin/sh
+# Renamed: Strata's installer is ./install now. It asks which optional parts
+# to install instead of taking flags for one laptop; ./install --help.
+echo "setup-tumbleweed is now ./install (see ./install --help)." >&2
+exec "$(dirname "$0")/install" "$@"

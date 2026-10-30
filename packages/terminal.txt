@@ -1,0 +1,6 @@
+# A nicer terminal: zsh with starship's prompt, fastfetch's greeting and
+# btop. The login shell is not changed; kitty starts zsh itself.
+zsh
+starship
+fastfetch
+btop
