@@ -72,6 +72,9 @@ qt6-wayland
 fontconfig
 adwaita-fonts
 google-noto-coloremoji-fonts
+# The launcher's emoji list is read from its data files.
+unicode-emoji
+iso-codes
 inter-fonts
 jetbrains-mono-fonts
 adwaita-icon-theme

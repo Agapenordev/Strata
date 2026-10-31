@@ -46,6 +46,7 @@ CORE_PATHS = (
     '.config/environment.d/60-strata.conf',
     '.config/systemd/user/strata.service',
     '.config/xdg-desktop-portal/niri-portals.conf',
+    '.config/autostart/polkit-gnome-authentication-agent-1.desktop',
     '.local/bin/strata',
     '.local/share/fonts', '.local/share/icons', '.local/share/wallpapers',
     '.local/share/strata', '.local/share/rishot', '.local/bin/rishot',
@@ -340,6 +341,11 @@ def doctor():
         subprocess.run(['sh', '-c', command], timeout=30, check=False)
 
     show('Versions', 'niri --version; qs --version; kitty --version; uname -r')
+    print('\n── Desktop packages', flush=True)
+    missing = [p for p in package_list('core.txt')
+               if subprocess.run(['rpm', '-q', '--whatprovides', p], capture_output=True).returncode != 0]
+    print(f'missing: {" ".join(missing)}\n  fix: sudo zypper install {" ".join(missing)}' if missing
+          else 'all installed')
     show('Fonts', 'fc-match "Rubik"; fc-match "Material Symbols Rounded"; fc-match "JetBrainsMono Nerd Font Mono"; '
                   'fc-match "Noto Color Emoji"')
     show('Session', 'systemctl --user is-active niri.service graphical-session.target xdg-desktop-portal.service')
@@ -350,7 +356,7 @@ def doctor():
                  "for d in /sys/bus/pci/devices/*; do [ \"$(cat $d/vendor)\" = 0x10de ] && [ -e $d/power/runtime_status ] "
                  "&& echo \"NVIDIA $(basename $d): $(cat $d/power/runtime_status)\"; done")
     show('Power profile', 'powerprofilesctl get 2>/dev/null || echo "power-profiles-daemon is not running"')
-    show('Memory and swap', 'free -h; swapon --show')
+    show('Memory and swap', 'free -h; cat /proc/swaps')
     show('Failed units', 'systemctl --failed --no-pager; systemctl --user --failed --no-pager')
 
 
