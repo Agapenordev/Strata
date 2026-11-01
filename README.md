@@ -94,7 +94,7 @@ wallpaper.
 > local terminal; it asks for sudo when it needs root.
 
 ```sh
-git clone https://github.com/<you>/strata ~/strata
+git clone https://github.com/Agapenordev/Strata ~/strata
 cd ~/strata
 ./install
 ```
